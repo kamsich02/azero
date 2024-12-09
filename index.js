@@ -2,7 +2,6 @@ require('dotenv').config();
 const { ApiPromise, WsProvider, Keyring } = require('@polkadot/api');
 const { cryptoWaitReady } = require('@polkadot/util-crypto');
 
-// Load environment variables
 const WS_ENDPOINT = process.env.WS_ENDPOINT;
 const SOURCE_SEED = process.env.SOURCE_SEED;
 const TARGET_ADDRESS = process.env.TARGET_ADDRESS;
@@ -29,46 +28,30 @@ async function main() {
     }
     console.log("Available balances methods:", Object.keys(api.tx.balances));
 
-    // We'll use transferKeepAlive to ensure we don't kill the account
-    // by dropping below existential deposit after the transfer.
-    const transferMethod = 'transferKeepAlive';
+    // Use transferAll with keepAlive = false to empty the account completely.
+    const transferMethod = 'transferAll';
 
     async function sweepIfNeeded() {
         try {
             console.log("Checking balance...");
 
-            // Derived balances give us a comprehensive overview
+            // Derived balances give us an overview, but for transferAll we just need to know if there's anything to send.
             const balancesAll = await api.derive.balances.all(sourceAccount.address);
             const freeBal = balancesAll.freeBalance;
             const reservedBal = balancesAll.reservedBalance;
             const lockedBal = balancesAll.lockedBalance;
-            const available = balancesAll.availableBalance; // Amount we can send without going below ED (ignores fees)
-
+            const available = balancesAll.availableBalance; // Transferable funds (not considering fees)
+            
             console.log(`Free: ${freeBal.toString()}, Reserved: ${reservedBal.toString()}, Locked: ${lockedBal.toString()}, Available: ${available.toString()}`);
 
             if (available.lten(0)) {
-                console.log("No transferable balance available to sweep (while keeping the account alive).");
+                console.log("No transferable balance available to sweep.");
                 return;
             }
 
-            // Estimate the fee for sending `available`.
-            let dummyTx = api.tx.balances[transferMethod](TARGET_ADDRESS, available);
-            const paymentInfo = await dummyTx.paymentInfo(sourceAccount);
-            const fee = paymentInfo.partialFee;
-            console.log(`Estimated fee: ${fee.toString()}`);
-
-            // If available <= fee, we can't send anything.
-            if (available.lte(fee)) {
-                console.log("Not enough balance to cover fees and remain above ED. No transfer executed.");
-                return;
-            }
-
-            // Adjust the amount to send to remain above ED after fees.
-            const amountToSend = available.sub(fee);
-            console.log(`Amount to send after accounting for fees: ${amountToSend.toString()}`);
-
-            const tx = api.tx.balances[transferMethod](TARGET_ADDRESS, amountToSend);
-            console.log(`Sweeping ${amountToSend.toString()} to ${TARGET_ADDRESS} using ${transferMethod}...`);
+            // Attempt to transfer all free funds
+            const tx = api.tx.balances[transferMethod](TARGET_ADDRESS, false);
+            console.log(`Sweeping all free funds (${available.toString()}) to ${TARGET_ADDRESS}, account may be emptied...`);
 
             const unsub = await tx.signAndSend(sourceAccount, ({ status, dispatchError }) => {
                 if (status.isInBlock || status.isFinalized) {
@@ -82,7 +65,7 @@ async function main() {
                             console.log('Transaction failed with error:', dispatchError.toString());
                         }
                     } else {
-                        console.log('Transfer successful.');
+                        console.log('Transfer successful. Account may now be empty.');
                     }
                     unsub();
                 }
