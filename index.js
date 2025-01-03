@@ -3,12 +3,16 @@ const { ApiPromise, WsProvider, Keyring } = require('@polkadot/api');
 const { cryptoWaitReady } = require('@polkadot/util-crypto');
 const BN = require('bn.js');
 
-const WS_ENDPOINT = process.env.WS_ENDPOINT;       // e.g., "wss://..."
-const SOURCE_SEED = process.env.SOURCE_SEED;       // mnemonic or raw seed
-const TARGET_ADDRESS = process.env.TARGET_ADDRESS; // recipient
+const WS_ENDPOINT = process.env.WS_ENDPOINT;       // e.g., "wss://yournode.io"
+const SOURCE_SEED = process.env.SOURCE_SEED;       // e.g., a mnemonic or raw seed
+const TARGET_ADDRESS = process.env.TARGET_ADDRESS; // address receiving the swept funds
 
 // On Aleph Zero, 1 AZERO = 10^12 plancks
 const ONE_AZERO = new BN('1000000000000');
+
+// We'll use a fixed buffer to cover fees (e.g., 0.00005 AZERO).
+// Adjust if you find it failing with “InsufficientBalance.”
+const FEE_BUFFER = new BN('50000000'); // 0.00005 AZERO
 
 async function main() {
   await cryptoWaitReady();
@@ -23,18 +27,18 @@ async function main() {
   const sourceAccount = keyring.addFromUri(SOURCE_SEED);
   console.log('Source account loaded:', sourceAccount.address);
 
-  // Subscribe to new blocks so we can react immediately
+  // Subscribe to new blocks
   console.log('Subscribing to new blocks...');
   await api.rpc.chain.subscribeNewHeads(async (header) => {
     console.log(`\nNew block #${header.number.toString()} detected. Checking balance...`);
 
     try {
-      // 1) Retrieve balances
+      // 1) Retrieve current balances
       const balancesAll = await api.derive.balances.all(sourceAccount.address);
       const freeBal = balancesAll.freeBalance;
       const reservedBal = balancesAll.reservedBalance;
       const lockedBal = balancesAll.lockedBalance;
-      const available = balancesAll.availableBalance;
+      const available = balancesAll.availableBalance; // BN
 
       console.log(
         `Free: ${freeBal.toString()}, ` +
@@ -43,7 +47,6 @@ async function main() {
         `Available: ${available.toString()}`
       );
 
-      // If no transferable balance, skip
       if (available.lten(0)) {
         console.log('No transferable balance available.');
         return;
@@ -52,78 +55,49 @@ async function main() {
       // 2) Construct the extrinsic (transferAll, keepAlive=false)
       const tx = api.tx.balances.transferAll(TARGET_ADDRESS, false);
 
-      // 3) Estimate fees with the .paymentInfo(...) method
-      const paymentInfo = await tx.paymentInfo(sourceAccount);
-      const estimatedFee = paymentInfo.partialFee;
-      console.log(`Estimated fee: ${estimatedFee.toString()} plancks`);
-
-      // 4) Apply a small buffer to avoid underestimating fees
-      const bufferFactor = 1.1; 
-      const bufferFee = estimatedFee
-        .muln(Math.ceil(bufferFactor * 100))
-        .divn(100);
-
-      // 5) Calculate how much is leftover for tip
-      // leftover = available - bufferFee
-      const leftover = available.sub(bufferFee);
-
-      // If leftover <= 0, we can't safely tip
+      // 3) Decide tip based on leftover after the fixed buffer
+      let leftover = available.sub(FEE_BUFFER);
       if (leftover.lten(0)) {
-        console.log('Not enough balance to tip safely. Sending with zero tip...');
-        await signAndSendTx(tx, sourceAccount, new BN(0), api);
-        return;
+        // If not enough balance to safely cover our buffer, tip zero
+        leftover = new BN(0);
       }
 
-      // If leftover > 0, decide how much to tip
-      let tip;
-      if (leftover.gt(ONE_AZERO)) {
-        // Cap at 1 AZERO
-        tip = ONE_AZERO;
-        console.log(`Leftover > 1 AZERO. Capping tip at 1 AZERO (${ONE_AZERO.toString()}).`);
-      } else {
-        // Otherwise use leftover as tip
-        tip = leftover;
-        console.log(`Using leftover as tip: ${tip.toString()} plancks.`);
-      }
+      // Cap tip at 1 AZERO (OneAzero)
+      const tip = BN.min(leftover, ONE_AZERO);
 
-      // 6) Sign & send with the decided tip
-      await signAndSendTx(tx, sourceAccount, tip, api);
+      console.log(
+        `Will send with tip: ${tip.toString()} plancks (buffer = ${FEE_BUFFER.toString()}).`
+      );
+
+      // 4) Sign & send with our chosen tip
+      const unsub = await tx.signAndSend(
+        sourceAccount,
+        { tip },
+        ({ status, dispatchError }) => {
+          if (status.isInBlock || status.isFinalized) {
+            const blockHash = status.asInBlock || status.asFinalized;
+            console.log(`Transaction included at blockHash ${blockHash}`);
+
+            if (dispatchError) {
+              if (dispatchError.isModule) {
+                const metaError = api.registry.findMetaError(dispatchError.asModule);
+                const { name, section } = metaError;
+                console.log(`Transaction failed with error: ${section}.${name}`);
+              } else {
+                console.log(`Transaction failed with error: ${dispatchError.toString()}`);
+              }
+            } else {
+              console.log('Transfer successful. Account may now be empty.');
+            }
+            unsub();
+          }
+        }
+      );
 
     } catch (err) {
       console.error('Error in subscribeNewHeads callback:', err);
     }
   });
-}
-
-// Helper function: sign and send with a tip
-async function signAndSendTx(tx, sourceAccount, tip, api) {
-  try {
-    const unsub = await tx.signAndSend(
-      sourceAccount,
-      { tip },
-      ({ status, dispatchError }) => {
-        if (status.isInBlock || status.isFinalized) {
-          const blockHash = status.asInBlock || status.asFinalized;
-          console.log(`Transaction included at blockHash ${blockHash}`);
-
-          if (dispatchError) {
-            if (dispatchError.isModule) {
-              const metaError = api.registry.findMetaError(dispatchError.asModule);
-              const { name, section } = metaError;
-              console.log(`Transaction failed with error: ${section}.${name}`);
-            } else {
-              console.log(`Transaction failed with error: ${dispatchError.toString()}`);
-            }
-          } else {
-            console.log('Transfer successful. Account may now be empty.');
-          }
-          unsub();
-        }
-      }
-    );
-  } catch (error) {
-    console.error('Error during signAndSendTx:', error);
-  }
 }
 
 main().catch(console.error);
